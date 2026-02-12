@@ -20,6 +20,7 @@ import (
 	congestion_meta2 "github.com/sagernet/sing-quic/congestion_meta2"
 	"github.com/sagernet/sing-quic/hysteria"
 	hyCC "github.com/sagernet/sing-quic/hysteria/congestion"
+	"github.com/sagernet/sing-quic/hysteria2/faketcp"
 	"github.com/sagernet/sing-quic/hysteria2/internal/protocol"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/auth"
@@ -44,6 +45,8 @@ type ServiceOptions struct {
 	UDPTimeout            time.Duration
 	Handler               ServerHandler
 	MasqueradeHandler     http.Handler
+	FakeTCP               bool
+	FakeTCPOptions        faketcp.Options
 }
 
 type ServerHandler interface {
@@ -67,6 +70,8 @@ type Service[U comparable] struct {
 	handler               ServerHandler
 	masqueradeHandler     http.Handler
 	quicListener          io.Closer
+	fakeTCP               bool
+	fakeTCPOptions        faketcp.Options
 }
 
 func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
@@ -103,6 +108,8 @@ func NewService[U comparable](options ServiceOptions) (*Service[U], error) {
 		udpTimeout:            options.UDPTimeout,
 		handler:               options.Handler,
 		masqueradeHandler:     options.MasqueradeHandler,
+		fakeTCP:               options.FakeTCP,
+		fakeTCPOptions:        options.FakeTCPOptions,
 	}, nil
 }
 
@@ -115,6 +122,16 @@ func (s *Service[U]) UpdateUsers(userList []U, passwordList []string) {
 }
 
 func (s *Service[U]) Start(conn net.PacketConn) error {
+	if s.fakeTCP {
+		// FakeTCP mode: replace the UDP PacketConn with a fake TCP one
+		listenAddr := conn.LocalAddr().String()
+		conn.Close()
+		ftConn, err := faketcp.Listen(s.ctx, "tcp", listenAddr, s.fakeTCPOptions)
+		if err != nil {
+			return E.Cause(err, "faketcp listen")
+		}
+		conn = ftConn
+	}
 	if s.salamanderPassword != "" {
 		conn = NewSalamanderConn(conn, []byte(s.salamanderPassword))
 	}

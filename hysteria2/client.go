@@ -19,6 +19,7 @@ import (
 	congestion_meta2 "github.com/sagernet/sing-quic/congestion_meta2"
 	"github.com/sagernet/sing-quic/hysteria"
 	hyCC "github.com/sagernet/sing-quic/hysteria/congestion"
+	"github.com/sagernet/sing-quic/hysteria2/faketcp"
 	"github.com/sagernet/sing-quic/hysteria2/internal/protocol"
 	"github.com/sagernet/sing/common/bufio"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -45,6 +46,8 @@ type ClientOptions struct {
 	Password           string
 	TLSConfig          aTLS.Config
 	UDPDisabled        bool
+	FakeTCP            bool
+	FakeTCPOptions     faketcp.Options
 }
 
 type Client struct {
@@ -62,6 +65,8 @@ type Client struct {
 	tlsConfig          aTLS.Config
 	quicConfig         *quic.Config
 	udpDisabled        bool
+	fakeTCP            bool
+	fakeTCPOptions     faketcp.Options
 
 	connAccess sync.Mutex
 	conn       *clientQUICConnection
@@ -83,6 +88,9 @@ func NewClient(options ClientOptions) (*Client, error) {
 	}
 	var serverPorts []uint16
 	if len(options.ServerPorts) > 0 {
+		if options.FakeTCP {
+			return nil, E.New("faketcp and port hopping (server_ports) are mutually exclusive")
+		}
 		var err error
 		serverPorts, err = hysteria.ParsePorts(options.ServerPorts)
 		if err != nil {
@@ -104,6 +112,8 @@ func NewClient(options ClientOptions) (*Client, error) {
 		tlsConfig:          options.TLSConfig,
 		quicConfig:         quicConfig,
 		udpDisabled:        options.UDPDisabled,
+		fakeTCP:            options.FakeTCP,
+		fakeTCPOptions:     options.FakeTCPOptions,
 	}, nil
 }
 
@@ -122,29 +132,41 @@ func (c *Client) offer(ctx context.Context) (*clientQUICConnection, error) {
 }
 
 func (c *Client) offerNew(ctx context.Context) (*clientQUICConnection, error) {
-	dialFunc := func(serverAddr M.Socksaddr) (net.PacketConn, error) {
-		udpConn, err := c.dialer.DialContext(c.ctx, "udp", serverAddr)
-		if err != nil {
-			return nil, err
-		}
-		var packetConn net.PacketConn
-		packetConn = bufio.NewUnbindPacketConn(udpConn)
-		if c.salamanderPassword != "" {
-			packetConn = NewSalamanderConn(packetConn, []byte(c.salamanderPassword))
-		}
-		return packetConn, nil
-	}
 	var (
 		packetConn net.PacketConn
 		err        error
 	)
-	if len(c.serverPorts) == 0 {
-		packetConn, err = dialFunc(c.serverAddr)
+	if c.fakeTCP {
+		// FakeTCP mode: use raw sockets with fake TCP headers instead of UDP
+		packetConn, err = faketcp.Dial(c.ctx, "tcp", c.serverAddr.String(), c.fakeTCPOptions)
+		if err != nil {
+			return nil, E.Cause(err, "faketcp dial")
+		}
+		if c.salamanderPassword != "" {
+			packetConn = NewSalamanderConn(packetConn, []byte(c.salamanderPassword))
+		}
 	} else {
-		packetConn, err = hysteria.NewHopPacketConn(dialFunc, c.serverAddr, c.serverPorts, c.hopInterval)
-	}
-	if err != nil {
-		return nil, err
+		// Standard UDP mode
+		dialFunc := func(serverAddr M.Socksaddr) (net.PacketConn, error) {
+			udpConn, err := c.dialer.DialContext(c.ctx, "udp", serverAddr)
+			if err != nil {
+				return nil, err
+			}
+			var pktConn net.PacketConn
+			pktConn = bufio.NewUnbindPacketConn(udpConn)
+			if c.salamanderPassword != "" {
+				pktConn = NewSalamanderConn(pktConn, []byte(c.salamanderPassword))
+			}
+			return pktConn, nil
+		}
+		if len(c.serverPorts) == 0 {
+			packetConn, err = dialFunc(c.serverAddr)
+		} else {
+			packetConn, err = hysteria.NewHopPacketConn(dialFunc, c.serverAddr, c.serverPorts, c.hopInterval)
+		}
+		if err != nil {
+			return nil, err
+		}
 	}
 	var quicConn *quic.Conn
 	http3Transport, err := qtls.CreateTransport(packetConn, &quicConn, c.serverAddr, c.tlsConfig, c.quicConfig)
